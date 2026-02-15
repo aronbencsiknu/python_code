@@ -1,35 +1,24 @@
-import torch.nn as nn
+"""
+Model definition for the RL-BEMS agent.
 
+When using stable-baselines3 SAC, the actor-critic networks are built
+automatically by SB3.  This file documents the architecture used.
 
-class DQN(nn.Module):
-    def __init__(self, obs_count, action_count):
-        super(DQN, self).__init__()
+SAC internally creates:
+    Actor  : MLP [256, 256] → Gaussian policy → tanh squash → action
+    Critic : Twin Q-networks, each MLP [256, 256] → scalar Q-value
+    Entropy : auto-tuned temperature α
 
-        # layers
-        self.fc1 = nn.Linear(obs_count, 20)
-        self.fc2 = nn.Linear(20, 20)
-        self.fc3 = nn.Linear(20, 20)
-        self.fc4 = nn.Linear(20, action_count)
-        self.activation = nn.LeakyReLU()
-        self.dropout = nn.Dropout(p=0.2)
+No manual model instantiation is needed — SB3 handles everything.
 
-    def forward(self, x):
+To customise the architecture, pass policy_kwargs to SAC:
 
-        # input layer
-        x = self.fc1(x)
-        x = self.activation(x)
+    from stable_baselines3 import SAC
 
-        # 1st hidden layer
-        x = self.fc2(x)
-        #x = self.dropout(x)
-        x = self.activation(x)
-
-        # 2nd hidden layer
-        x = self.fc3(x)
-        #x = self.dropout(x)
-        x = self.activation(x)
-
-        # output layer
-        x = self.fc4(x)
-
-        return x
+    model = SAC(
+        "MlpPolicy",
+        env,
+        policy_kwargs=dict(net_arch=[256, 256]),
+        ...
+    )
+"""

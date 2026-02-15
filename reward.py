@@ -1,64 +1,46 @@
-import wandb
-class Reward:
-    def __init__(self, max_temp=25, min_temp=20, crit_max_temp=27, crit_min_temp=17, max_crit_time=120, max_allowed_temp_change=1):
+"""
+Reward utility — standalone reference for reward calculation.
 
-        self.max_temp = max_temp
-        self.min_temp = min_temp
-        self.crit_max_temp = crit_max_temp
-        self.crit_min_temp = crit_min_temp
-        self.max_crit_time = max_crit_time
-        self.max_allowed_temp_change = max_allowed_temp_change
-        self.current_crit_time = 0
-    
-    def update(self, max_temp, min_temp, crit_max_temp, crit_min_temp, max_crit_time, max_allowed_temp_change):
-        self.max_temp = max_temp
-        self.min_temp = min_temp
-        self.crit_max_temp = crit_max_temp
-        self.crit_min_temp = crit_min_temp
-        self.max_crit_time = max_crit_time
-        self.max_allowed_temp_change = max_allowed_temp_change
+The reward is computed directly inside HydronicHeatingEnv.step().
+This file is kept as documentation and for standalone analysis.
+"""
 
-    def calculate_reward(self, indoor_temp, indoor_temp_history, heating):
 
-        temp_midpoint = (self.max_temp + self.min_temp) / 2  # midpoint
+def compute_reward(T_in, T_set, energy_kWh, delta_shift, valve_osc,
+                   alpha=1.0, beta=0.1, gamma_r=0.5, delta_w=0.1,
+                   asymmetry=1.5, hard_band=2.0, hard_penalty=5.0):
+    """
+    R = - alpha * comfort_penalty
+        - beta  * energy_used
+        - gamma * |ΔT_shift|
+        - delta * valve_oscillation
 
-        prev_indoor_temp = indoor_temp_history[len(indoor_temp_history) - 2]  # get second last temp value
-        temp_change = abs(indoor_temp - prev_indoor_temp)
+    Parameters
+    ----------
+    T_in         : float – indoor air temperature (°C)
+    T_set        : float – room setpoint (°C)
+    energy_kWh   : float – energy consumed this step (kWh)
+    delta_shift  : float – absolute curve-shift change this step (K)
+    valve_osc    : float – total valve movement this step (% cumulative)
+    alpha … hard_penalty : reward weight parameters
 
-        # Calculate reward for indoor temperature control
-        if self.min_temp <= indoor_temp <= self.max_temp:
-            r1 = 0.0
-            if self.current_crit_time > 0:
-                self.current_crit_time -= 1
+    Returns
+    -------
+    total, r_comfort, r_energy, r_smooth, r_valve
+    """
+    temp_error = T_in - T_set
 
-        elif self.crit_min_temp <= indoor_temp <= self.crit_max_temp and self.current_crit_time < self.max_crit_time:
-            r1 = 0.0
-            self.current_crit_time += 1
+    if temp_error < 0:
+        r_comfort = -alpha * asymmetry * temp_error ** 2
+    else:
+        r_comfort = -alpha * temp_error ** 2
 
-        else:
-            r1 = -abs(indoor_temp - temp_midpoint)
+    if abs(temp_error) > hard_band:
+        r_comfort -= hard_penalty * (abs(temp_error) - hard_band)
 
-        # Calculate reward for energy savings
-        if heating:
-            r2 = -1.0
-        else:
-            r2 = 0.0
+    r_energy = -beta * energy_kWh
+    r_smooth = -gamma_r * delta_shift
+    r_valve = -delta_w * (valve_osc / 100.0)
 
-        if self.max_allowed_temp_change < temp_change:
-            r3 = 0.0
-        else:
-            r3 = -abs(self.max_allowed_temp_change - temp_change)
-
-        # reward weighing
-        r1_w = 1.0  # temperature range
-        r2_w = 1.3  # energy
-        r3_w = 1.0  # temp change
-
-        # Calculate total reward
-        r1_weighed = r1 * r1_w
-        r2_weighed = r2 * r2_w
-        r3_weighed = r3 * r3_w
-
-        total_reward = r1_weighed + r2_weighed + r3_weighed
-
-        return total_reward, r1, r2, r3
+    total = r_comfort + r_energy + r_smooth + r_valve
+    return total, r_comfort, r_energy, r_smooth, r_valve

@@ -1,427 +1,243 @@
 # %% imports
-import json
 import pathlib
-import numpy as np
-import torch
-import torch.nn as nn
-from collections import deque
-import random
-from progress.bar import ShadyBar
-from datetime import datetime
-import time
 import argparse
-import os
-import wandb
+import numpy as np
 
-from environment import Environment  # import environment simulation
-from options import Options  # import options
-from reward import Reward  # import reward mechanism for agent
-from plot import Plot  # import environment plotting
-from model import DQN  # import DQN model
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import BaseCallback
 
-# %% define variables
+from environment import HydronicHeatingEnv
+from options import Options
+from plot import Plot
 
-# parse arguments
-parser = argparse.ArgumentParser()
 
-# argument for local demo
-parser.add_argument("-l", "--localdemo", help="run demo locally without connecting to the server",
+# %%  ==================  BASELINE CONTROLLER  =========================
+
+class BaselineController:
+    """
+    Non-RL baseline: fixed heating-curve slope with a slow PI
+    on room-temperature error that nudges the curve shift.
+    """
+
+    def __init__(self, Kp_room=0.1, Ki_room=0.001, base_shift=0.0,
+                 shift_step_limit=0.5):
+        self.Kp_room = Kp_room
+        self.Ki_room = Ki_room
+        self.base_shift = base_shift
+        self.shift_step_limit = shift_step_limit
+        self.integral = 0.0
+        self.current_shift = base_shift
+
+    def predict(self, T_in, T_set):
+        """Return a continuous ΔT_shift action as np array."""
+        error = T_set - T_in
+        self.integral += error
+        self.integral = float(np.clip(self.integral, -50.0, 50.0))
+
+        desired_shift = self.base_shift + self.Kp_room * error + self.Ki_room * self.integral
+        desired_delta = desired_shift - self.current_shift
+        desired_delta = float(np.clip(
+            desired_delta, -self.shift_step_limit, self.shift_step_limit
+        ))
+        self.current_shift += desired_delta
+        return np.array([desired_delta], dtype=np.float32)
+
+    def reset(self):
+        self.integral = 0.0
+        self.current_shift = self.base_shift
+
+
+# %%  ==================  OPTIONAL WANDB CALLBACK  =====================
+
+class WandbRewardCallback(BaseCallback):
+    """Logs episode rewards to W&B if enabled."""
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if "episode" in info:
+                try:
+                    import wandb
+                    wandb.log({
+                        "episode_reward": info["episode"]["r"],
+                        "episode_length": info["episode"]["l"],
+                    })
+                except Exception:
+                    pass
+        return True
+
+
+# %%  ==================  PARSE ARGUMENTS  =============================
+
+parser = argparse.ArgumentParser(description="RL-BEMS: Hydronic Heating with SAC")
+parser.add_argument("-p", "--pretrain",
+                    help="train a new SAC model from scratch",
                     action="store_true")
-
-# argument for training
-parser.add_argument("-p", "--pretrain", help="train a new model",
+parser.add_argument("-l", "--localdemo",
+                    help="run a local demo with a trained model",
                     action="store_true")
-
-# argument for wandb logging
-parser.add_argument("-wb", "--wandb", help="log to weights&biases",
+parser.add_argument("-b", "--baseline",
+                    help="run the baseline controller for comparison",
                     action="store_true")
-
-# argument used during GUI demo to define the greenhouse indices
-parser.add_argument("-g",'--gindex', type=int)
-
+parser.add_argument("-wb", "--wandb",
+                    help="log training to Weights & Biases",
+                    action="store_true")
 args = parser.parse_args()
 
-# from plotting import Plot
+
+# %%  ==================  INITIALISE  ==================================
+
 opt = Options()
-
-# we can declare max/min temps here, but we can also change them later via a setter method in Reward
-reward = Reward()
-
-# we can change the desired plotting colours here
 plotting = Plot()
 
-# initialize environment simulation
-environment = Environment(
-    0.1,  # cloudiness
-    0.5)  # energy_consumption
+# resolve paths
+current_dir = pathlib.Path(__file__).resolve().parent
+project_dir = current_dir.parent
+model_dir = project_dir / opt.path_to_model_from_root
+model_path = model_dir / opt.model_name
 
 
-observation = environment.get_state()  # get initial observation of the environment
-obs_count = len(observation)  # get the number of environment observations
+# %%  ==================  TRAINING  ====================================
 
-# number of possible actions (heat on, vent closed; vent open, heat off; both off)
-action_count = 3 
-
-# initialize DQN
-model = DQN(obs_count, action_count).to(opt.device)
-
-if not args.pretrain:
-
-    # load saved model
-    current_dir = pathlib.Path(__file__).resolve()
-    parent_dir = current_dir.parents[1]
-    path = pathlib.Path(parent_dir / opt.path_to_model_from_root / opt.model_name_load)
-    model.load_state_dict(torch.load(path, map_location=torch.device(opt.device)))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=opt.demo_learning_rate)  # AdamW optimizer
-
-else:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=opt.learning_rate)  # AdamW optimizer
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=opt.num_episodes)  # learning rate scheduler
-
-model.eval()
-
-loss_fn = opt.loss_fn  # loss function
-beta = opt.beta  # epsilon decay rate
-memory = deque([], maxlen=2500)  # experience memory
-
-# %% function definitions
-def experience_replay(model, batch_size, memory, obs_count):
-    """
-    1. Selects random samples form the experience memory.
-    2. Generates labels using the Bellman optimality equation
-    3. Trains the DQN uaing the IIDD data
-
-    --------
-    :param model: DQN network
-    :param batch_size: size of random samples taken from memory
-    :param memory: experience memory
-    :param obs_count: observation size of the environment
-    :param epoch_count: epoch count for training the DQN
-    :return:
-    """
-    
-    batch = random.sample(memory, batch_size)  # get random batch from memory with size batch_size
-    batch_vector = np.array(batch, dtype=object)
-
-    # create np arrays with correct shapes
-    obs_t = np.zeros(shape=(batch_size, obs_count))
-    obs_t_next = np.zeros(shape=(batch_size, obs_count))
-
-    # store observations at time t and time t+1 from the batch vector
-    for i in range(len(batch_vector)):
-        obs_t[i] = batch_vector[i, 0]
-        obs_t_next[i] = batch_vector[i, 3]
-
-    # predict actions for time t and time t+1
-    with torch.no_grad():
-        prediction_at_t = model(torch.tensor(obs_t).float().to(opt.device)).to("cpu")
-        prediction_at_t_next = model(torch.tensor(obs_t_next).float().to(opt.device)).to("cpu")
-
-    X = []  # training samples list
-    y = []  # target list
-
-    i = 0
-    for obs_t, action, reward_value, _ in batch_vector:
-
-        X.append(obs_t)  # append training sample list
-
-        """ 
-        bellman optimality equation:
-        target = reward + discount_rate * argmax(DQN(obs_t+1))
-
-        """
-        target = reward_value + opt.gamma * np.max(prediction_at_t_next[i].numpy())
-
-        # update action value
-        prediction_at_t[i, action] = target
-
-        # append to target list
-        y.append(prediction_at_t[i].numpy())
-
-        i += 1
-
-    X = np.array(X).reshape(batch_size, obs_count)  # trainig samples 
-    y = np.array(y)  # targets
-
-    loss_avg = 0
-    model.train()
-    for epoch in range(opt.num_epochs):
-
-        # Forward pass
-        y_pred = model(torch.tensor(X).float().to(opt.device))
-        loss_val = loss_fn(y_pred, torch.tensor(y).to(opt.device))
-        loss_avg += loss_val.item()
-
-        # Backward pass
-        optimizer.zero_grad()
-        loss_val.backward()
-        optimizer.step()
-    
-    model.eval()
-
-    return loss_avg
-
-
-def forward_pass(obs_t, epsilon):
-    """
-    1. Gets an action either by exploring or exploiting, depending on the current epsilon value.
-    2. Advances simulation with the action.
-    3. Calculates reward.
-    4. Appends to experience memorx.
-
-    --------
-    :param obs_t: observation at time t
-    :param epsilon: current epsilon value
-    :return: returns the observation at time t and the total reward
-    """
-
-    # explore
-    if np.random.random() < epsilon:
-        action_index = random.randint(0, action_count - 1)
-
-    # exploit
-    else:
-        with torch.no_grad():
-            action = model(torch.tensor(obs_t).float().to(opt.device)).to("cpu")
-            action_index = np.argmax(action)
-
-    # set actions
-    if action_index == 0:
-        heating = True
-        ventilation = False
-    elif action_index == 1:
-        heating = False
-        ventilation = True
-    else:
-        heating = False
-        ventilation = False
-
-    # advance simulation with actions
-    environment.run(
-        heating=heating, 
-        cooling=ventilation, 
-        steps=1, 
-        output_format='none', 
-        max_temp=reward.max_temp, 
-        min_temp=reward.min_temp, 
-        crit_max_temp=reward.crit_max_temp, 
-        crit_min_temp=reward.crit_min_temp
-    )
-
-    # get environment state
-    obs_t_next = environment.get_state()
-
-    # calculate reward
-    reward_value, r1, r2, r3 = reward.calculate_reward(
-        environment.greenhouse.temp, 
-        environment.H_temp,
-        heating
-    )
-
-    # append to experience memory
-    memory.append((obs_t, action_index, reward_value, obs_t_next))
-    obs_t = obs_t_next
-
-    return obs_t, reward_value, r1, r2, r3
-
-
-# %% program run
-
-# uhm, this does something with the GUI, I'm not sure, i didn't write this
-if not args.pretrain and not args.localdemo:
-    import requests
-    response = requests.get('http://127.0.0.1:3000/index.html',
-                            headers={'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
-
-# run pre-training
 if args.pretrain:
 
-    # optional WandB logging
+    print("=" * 60)
+    print("  SAC Training — Hydronic Heating RL-BEMS")
+    print("=" * 60)
+    print(f"  Device        : {opt.device}")
+    print(f"  Timesteps     : {opt.total_timesteps:,}")
+    print(f"  Batch size    : {opt.batch_size}")
+    print(f"  Buffer size   : {opt.buffer_size:,}")
+    print(f"  Net arch      : {opt.net_arch}")
+    print(f"  Learning rate : {opt.learning_rate}")
+    print(f"  Gamma         : {opt.gamma}")
+    print("=" * 60, "\n")
+
+    # create environment
+    env = HydronicHeatingEnv(opt.env_config)
+
+    # optional W&B
+    callbacks = []
     if args.wandb:
-        key=opt.wandb_key
-        wandb.login(key=key)
-        wandb_group = "test"
+        import wandb
+        wandb.login(key=opt.wandb_key)
+        wandb.init(project=opt.wandb_project, group="SAC_training",
+                   settings=wandb.Settings(start_method="thread"))
+        callbacks.append(WandbRewardCallback())
 
-        wandb.init(project="RL_GEMS", 
-                group=wandb_group, entity="aronbencsik", 
-                settings=wandb.Settings(start_method="thread"))
-        
-    for episode in range(opt.num_episodes):
-        environment = Environment(
-            0.1,  # cloudiness
-            0.5)  # energy_consumption
-        obs_t = environment.get_state()
+    # create SAC agent
+    model = SAC(
+        "MlpPolicy",
+        env,
+        learning_rate=opt.learning_rate,
+        batch_size=opt.batch_size,
+        buffer_size=opt.buffer_size,
+        gamma=opt.gamma,
+        tau=opt.tau,
+        ent_coef=opt.ent_coef,
+        learning_starts=opt.learning_starts,
+        train_freq=opt.train_freq,
+        gradient_steps=opt.gradient_steps,
+        policy_kwargs=dict(net_arch=opt.net_arch),
+        device=opt.device,
+        verbose=1,
+    )
 
-        epsilon = 1 / (1 + opt.beta * (episode / action_count))
+    # train
+    model.learn(
+        total_timesteps=opt.total_timesteps,
+        callback=callbacks if callbacks else None,
+        progress_bar=True,
+    )
 
-        bar_title = "Episode " + str(episode + 1) + " of " + str(opt.num_episodes)
-        bar = ShadyBar(bar_title, max=opt.episode_len)
+    # save
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model.save(str(model_path))
+    print(f"\nModel saved to: {model_path}")
 
-        total_reward = 0
-        loss_avg = 0
-
-        # wandb logging averages
-        wandb_avg_r1 = 0
-        wandb_avg_r2 = 0
-        wandb_avg_r3 = 0
-        wandb_avg_r_t = 0
-        wandb_avg_l = 0
-
-        for ep_index in range(opt.episode_len):
-            
-            if ep_index % 500 == 0:
-                midpoint = random.randint(22, 23)
-
-                # training DQN to deal with changing reward values
-                reward.update(max_temp=midpoint + random.randint(1, 2),
-                              min_temp=midpoint - random.randint(1, 2),
-                              crit_max_temp=midpoint + random.randint(3, 4),
-                              crit_min_temp=midpoint - random.randint(3, 4),
-                              max_crit_time=random.randint(30, 60),
-                              max_allowed_temp_change=random.randint(1, 5))
-            
-            # run forward pass and advance simulation
-            obs_t, reward_value, r1, r2, r3 = forward_pass(obs_t, epsilon)
-            
-            total_reward += reward_value
-            
-
-            # train DQN and calculate loss
-            if len(memory) > opt.batch_size:
-                
-                loss= experience_replay(model, opt.batch_size, memory, obs_count)
-                loss_avg += loss
-
-                if args.wandb:
-
-                    # increment WandB averages
-                    wandb_avg_r1 += r1
-                    wandb_avg_r2 += r2
-                    wandb_avg_r3 += r3
-                    wandb_avg_r_t += reward_value
-                    wandb_avg_l += loss/opt.num_epochs
-
-                    if ep_index % opt.wandb_logging_freq == 0:
-                
-                        # log values at frequency {opt.wandb_logging_freq}
-                        wandb.log({
-                            "Loss": wandb_avg_l/opt.wandb_logging_freq,
-                            "Total reward": wandb_avg_r_t/opt.wandb_logging_freq,
-                            "Temp range reward": wandb_avg_r1/opt.wandb_logging_freq,
-                            "Energy reward": wandb_avg_r2/opt.wandb_logging_freq,
-                            "Temp change reward": wandb_avg_r3/opt.wandb_logging_freq,
-                            "Epsilon": epsilon,
-                            "Learning rate": optimizer.param_groups[0]["lr"]
-                        })
-
-                        # reset WandB averages
-                        wandb_avg_r1 = 0
-                        wandb_avg_r2 = 0
-                        wandb_avg_r3 = 0
-                        wandb_avg_r_t = 0
-                        wandb_avg_l = 0
-
-
-            bar.next()  # update progress bar
-
-        bar.finish()
-        avg_reward = total_reward / opt.episode_len
-        scheduler.step()
-
-        print("\t - Avg. reward: %.4f" % avg_reward, "\n"
-              "\t - Avg. loss: %.4f" % (loss_avg / opt.episode_len), "\n"
-              "\t - Epsilon: %.4f" % epsilon, "\n"
-              "\t - Learning rate: %.6f" % optimizer.param_groups[0]["lr"], 
-              "\n")
-
-    current_dateTime = datetime.now()
-    current_dir = pathlib.Path(__file__).resolve()
-    parent_dir = current_dir.parents[1]
-    path = pathlib.Path(parent_dir / opt.path_to_model_from_root / opt.model_name_save)
-    torch.save(model.state_dict(), path)
     if args.wandb:
         wandb.finish()
-    plotting.plot(environment)
 
-# run local or GUI demo
+    # plot last episode
+    plotting.plot(env)
+
+
+# %%  ==================  LOCAL DEMO  ==================================
+
+elif args.localdemo:
+
+    print("=" * 60)
+    print("  SAC Demo — Hydronic Heating RL-BEMS")
+    print("=" * 60)
+
+    # load trained model
+    print(f"  Loading model: {model_path}")
+    model = SAC.load(str(model_path), device=opt.device)
+
+    # create fresh environment
+    env = HydronicHeatingEnv(opt.env_config)
+    obs, info = env.reset()
+
+    total_reward = 0.0
+    step_count = 0
+    done = False
+
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        step_count += 1
+        done = terminated or truncated
+
+    avg_reward = total_reward / max(step_count, 1)
+    print(f"\n  Steps         : {step_count}")
+    print(f"  Total reward  : {total_reward:.2f}")
+    print(f"  Avg reward    : {avg_reward:.4f}")
+    print(f"  Energy used   : {env.energy_cumulative:.1f} kWh\n")
+
+    plotting.plot(env)
+
+
+# %%  ==================  BASELINE COMPARISON  =========================
+
+elif args.baseline:
+
+    print("=" * 60)
+    print("  Baseline Controller — Hydronic Heating RL-BEMS")
+    print("=" * 60)
+
+    env = HydronicHeatingEnv(opt.env_config)
+    obs, info = env.reset()
+
+    baseline = BaselineController(
+        shift_step_limit=opt.env_config['shift_step_limit']
+    )
+    baseline.reset()
+
+    total_reward = 0.0
+    step_count = 0
+    done = False
+
+    while not done:
+        action = baseline.predict(env.building.T_air, env.heating_curve.T_room_set)
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        step_count += 1
+        done = terminated or truncated
+
+    avg_reward = total_reward / max(step_count, 1)
+    print(f"\n  Steps         : {step_count}")
+    print(f"  Total reward  : {total_reward:.2f}")
+    print(f"  Avg reward    : {avg_reward:.4f}")
+    print(f"  Energy used   : {env.energy_cumulative:.1f} kWh\n")
+
+    plotting.plot(env)
+
+
+# %%  ==================  HELP  ========================================
+
 else:
-    
-    obs_t = environment.get_state()
-    epsilon = 0
-    total_reward = 0
-    loss_avg = 0
-
-    if args.localdemo:
-        print("Model loaded.")
-        print("Model name: ", opt.model_name_load,"\n")
-        demo_len = opt.local_demo_len
-        bar_title = "Progress"
-        bar = ShadyBar(bar_title, max=opt.local_demo_len)
-    else:
-        demo_len = opt.gui_demo_len
-
-    for i in range(demo_len):
-
-        # if demo-ing with GUI, read and write to JSON file
-        if not args.localdemo:
-            time.sleep(opt.demo_sleep)
-            # LAKEvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-            
-            # default value is -5 when there is not enough data yet
-            avg_consumption = -5
-            if environment.step > 60:
-                last_60_energy = environment.H_greenhouse_heating[len(environment.H_greenhouse_heating) - 61: len(environment.H_greenhouse_heating) -1]
-                avg_consumption = np.mean(last_60_energy)
-
-            path = pathlib.Path(os.path.join(parent_dir, "public", "json", "gh" + str(args.gindex) + "_obs.json"))
-
-            # format elapsed time
-            day = "{:02d}".format(environment.day)
-            hour = "{:02d}".format(environment.hour)
-            minute = "{:02d}".format(environment.minute)
-            with open(path, 'w+') as f:
-                json.dump({"Greenhouse_temp": environment.greenhouse.temp, 
-                            "Outside_temp": environment.temp,
-                            "Time": str(day) +":"+str(hour) +":"+ str(minute),
-                            "Ventilation": int(environment.greenhouse.ventilation),
-                            "Heating": int(environment.greenhouse.heating),
-                            "Average_consumption": avg_consumption}, f)
-
-            # LAKE^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-            try:
-                path = pathlib.Path(os.path.join(parent_dir, "public", "json", "gh" + str(args.gindex) + "_settings.json"))
-                # LAKEvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-                with open(path, 'r') as f:
-                    data = json.load(f)
-                # LAKE^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-                # LAKEvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-                reward.min_temp = int(data['minTemp'])
-                reward.max_temp = int(data['maxTemp'])
-                reward.max_allowed_temp_change = int(data['rateOfChange'])
-                reward.crit_min_temp = int(data['critMinTemp'])
-                reward.crit_max_temp = int(data['critMaxTemp'])
-                reward.crit_time = int(data['maxTime'])
-                # LAKE^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-            except FileNotFoundError:
-                print("settings not found")
-                continue
-        
-        # if demo-ing locally, just update the progressbar
-        else:
-            bar.next()  # update progress bar
-
-        # run forward pass and advance simulation
-        obs_t, reward_value, r1, r2, r3 = forward_pass(obs_t, epsilon)
-        total_reward += reward_value
-        
-        if len(memory) > opt.batch_size:
-            # train DQN and calculate loss
-            loss_avg += experience_replay(model, opt.batch_size, memory, obs_count)
-
-    # finish progress bar and plot environment for local demo
-    if args.localdemo:
-        avg_reward = total_reward / opt.local_demo_len
-        print("\n\n avg reward: %.4f" % avg_reward)
-        bar.finish()
-        plotting.plot(environment)
+    parser.print_help()
